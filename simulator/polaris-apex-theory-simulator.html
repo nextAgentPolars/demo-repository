@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Polaris Apex Theory — Runtime Convergence Simulator (P1–P5)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-950 min-h-screen flex items-start justify-center p-4">
+
+  <div id="root" class="w-full max-w-5xl"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    /* ============================================================
+       Constants
+       ============================================================ */
+    const SPACE   = { w: 500, h: 500 };
+    const START   = { x: 50,  y: 50  };
+    const GOAL    = { x: 450, y: 450 };
+
+    const STEP         = 10;   // how far we travel per frame
+    const TICK_MS      = 110;  // frame cadence
+    const ARRIVE_TOL   = 26;   // how close counts as "arrived" at a checkpoint / the goal
+    const STABLE_NEED  = 4;    // consecutive stable frames the external gate demands before it trusts you (P3)
+    const RECOVER_NEED = 6;    // steady forward frames an open deviation must see before it can close (P4)
+    const MAX_TRIPS    = 6;    // consecutive trips before we call it — P4's honest edge: recovery is promised, free recovery is not
+
+    // Three waypoints plus the finish line — together they split the run into four segments
+    const CHECKPOINTS = [
+      { id: 'CP1', at: 0.25 },
+      { id: 'CP2', at: 0.50 },
+      { id: 'CP3', at: 0.75 },
+      { id: 'GOAL', at: 1.00 },
+    ].map(c => ({
+      ...c,
+      x: START.x + (GOAL.x - START.x) * c.at,
+      y: START.y + (GOAL.y - START.y) * c.at,
+    }));
+
+    /* ============================================================
+       Helpers
+       ============================================================ */
+    const dist = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+
+    // Perpendicular distance from the ideal line (A→B) — this is the "deviation" the Ψ gate keeps an eye on
+    function deviationFromPath(p) {
+      const dx = GOAL.x - START.x, dy = GOAL.y - START.y;
+      const t = ((p.x - START.x) * dx + (p.y - START.y) * dy) / (dx * dx + dy * dy);
+      const proj = { x: START.x + t * dx, y: START.y + t * dy };
+      return dist(p, proj);
+    }
+
+    // Checksum over the sealed points — the receipts backing P1's claim that "sealed means sealed"
+    function sealChecksum(points) {
+      if (!points.length) return '—';
+      let h = 0;
+      for (const p of points) h = (h * 31 + Math.round(p.x) * 7 + Math.round(p.y) * 13) >>> 0;
+      return h.toString(16).padStart(8, '0').slice(0, 8);
+    }
+
+    /* ============================================================
+       The P3 external acceptance gate
+       ------------------------------------------------------------
+       This function takes a projection of the current state — never
+       the full internal state. It can't see the trajectory history,
+       and it can't see what the system thinks of itself.
+       That's the only difference between P3 and "the system feels
+       like it's arrived" — and it's the one that decides everything.
+       ============================================================ */
+    function externalGateVerify(projection, cfg) {
+      const checks = {
+        // ① Position: a geometric check anyone can recompute
+        position:   projection.distToTarget <= cfg.tolerance,
+        // ② Invariant: no live Ψ violation at this moment
+        psi:        !projection.psiActive,
+        // ③ Open deviations: every recovery must leave a traceable record — and that record must be closed
+        noPending:  projection.pendingDeviations === 0,
+        // ④ Stability: it has to hold consecutively, not land inside tolerance on one lucky frame
+        stability:  projection.stableFrames >= cfg.stableNeed,
+      };
+      const failing = Object.keys(checks).filter(k => !checks[k]);
+      return {
+        checks,
+        pass: failing.length === 0,
+        failing,
+        // Rejection reasons are machine-recomputable facts, not judgment calls
+        reasons: {
+          position:  `dist=${projection.distToTarget.toFixed(1)} > tol=${cfg.tolerance}`,
+          psi:       'active Ψ violation',
+          noPending: `${projection.pendingDeviations} unclosed deviation(s)`,
+          stability: `stable ${projection.stableFrames}/${cfg.stableNeed} frames`,
+        },
+      };
+    }
+
+    // Internal self-check: all it ever asks is "am I close enough?"
+    // The textbook way to be green without being proven.
+    function internalSelfAssessment(projection, cfg) {
+      return projection.distToTarget < cfg.tolerance * 2.2;
+    }
+
+    /* ============================================================
+       The main component
+       ============================================================ */
+    const ConvergenceSimulator = () => {
+      const [noiseLevel,   setNoiseLevel]   = useState(12);
+      const [psiThreshold, setPsiThreshold] = useState(58);
+
+      const [isRunning,  setIsRunning]  = useState(false);
+      const [phase,      setPhase]      = useState('P1');   // P1..P5 / DONE
+      const [pos,        setPos]        = useState(START);
+      const [sealed,     setSealed]     = useState([]);     // P1: sealed for good — these points never change again
+      const [active,     setActive]     = useState([START]);// the current segment, fair game for a rollback
+      const [snapshots,  setSnapshots]  = useState([START]);
+      const [deviations, setDeviations] = useState([]);     // the deviation ledger
+      const [stableFrames, setStableFrames] = useState(0);
+      const [gate,       setGate]       = useState(null);
+      const [selfOk,     setSelfOk]     = useState(false);
+      const [cpIndex,    setCpIndex]    = useState(0);      // the next checkpoint waiting to close out
+      const [logs,       setLogs]       = useState(['[P1 steady state] Holding an established state, waiting to advance']);
+
+      const rafRef   = useRef();
+      const lastTick = useRef(0);
+      const tickN    = useRef(0);
+      const tripRef  = useRef(0);   // consecutive trip counter for the Ψ circuit breaker
+
+      // Latest values mirrored for the RAF loop — closures will happily serve stale state if you let them
+      const simRef = useRef({});
+      const cfgRef = useRef({});
+      simRef.current = { pos, sealed, active, snapshots, deviations, stableFrames, cpIndex, phase };
+      cfgRef.current = { noiseLevel, psiThreshold, tolerance: ARRIVE_TOL, stableNeed: STABLE_NEED };
+
+      const addLog = (msg) => setLogs(prev => [msg, ...prev].slice(0, 6));
+
+      /* ---------- one frame ---------- */
+      const step = (ts) => {
+        if (!isRunning) return;
+        if (ts - lastTick.current < TICK_MS) {
+          rafRef.current = requestAnimationFrame(step);
+          return;
+        }
+        lastTick.current = ts;
+        tickN.current += 1;
+
+        const s = simRef.current;
+        const c = cfgRef.current;
+
+        // Converged — nothing left to chase
+        if (s.phase === 'DONE') { setIsRunning(false); return; }
+
+        const target = CHECKPOINTS[Math.min(s.cpIndex, CHECKPOINTS.length - 1)];
+
+        /* --- P2 continuous advance: one step toward the target (steps shrink as we close in), plus noise W --- */
+        const d = dist(s.pos, target);
+        const stepLen = Math.min(STEP, d);
+        const nx = s.pos.x + ((target.x - s.pos.x) / (d || 1)) * stepLen + (Math.random() - 0.5) * c.noiseLevel * 2;
+        const ny = s.pos.y + ((target.y - s.pos.y) / (d || 1)) * stepLen + (Math.random() - 0.5) * c.noiseLevel * 2;
+        const next = { x: nx, y: ny };
+
+        const dev = deviationFromPath(next);
+        const newActive = [...s.active, next];
+
+        /* --- P4 failure recovery: the Ψ gate trips, we fall back to the nearest snapshot --- */
+        if (dev > c.psiThreshold) {
+          tripRef.current += 1;
+          // P4's edge: "broken can come back" is a promise; "every failure comes back for free" is not
+          if (tripRef.current > MAX_TRIPS) {
+            setIsRunning(false);
+            setPhase('P4');
+            addLog(`[P4 boundary] Tripped ${MAX_TRIPS} times in a row — noise W has outrun the recovery envelope. P4 promises "broken can come back", not "every failure comes back for free". Dial the noise down.`);
+            return;
+          }
+          const back = s.snapshots[s.snapshots.length - 1];
+          const rec = { id: tickN.current, at: { ...next }, dev: dev.toFixed(1), closed: false, recovered: 0 };
+          setDeviations([...s.deviations, rec]);
+          setPos(back);
+          // The crucial bit: truncate the active segment only. Sealed segments don't move an inch — that's P1 doing its job
+          setActive([back]);
+          setStableFrames(0);
+          setPhase('P4');
+          addLog(`[P4 Ψ trip] Deviation ${dev.toFixed(1)} > threshold ${c.psiThreshold}. Rolling back to snapshot; ledger entry #${rec.id} stays open until steady progress closes it.`);
+          rafRef.current = requestAnimationFrame(step);
+          return;
+        }
+
+        tripRef.current = 0;
+        setPos(next);
+        setActive(newActive);
+
+        /* --- P4's closing rule: an open deviation may only close once we're back to "steady forward progress" --- */
+        // If deviations could only close at acceptance time, and acceptance was blocked by open deviations,
+        // P3 and P4 would deadlock each other forever.
+        // So per P4's actual meaning, the closing condition is "we can advance again" — not "we arrived".
+        let devs = s.deviations.map(x =>
+          x.closed ? x : { ...x, recovered: (x.recovered || 0) + 1 });
+        devs = devs.map(x =>
+          (!x.closed && x.recovered >= RECOVER_NEED) ? { ...x, closed: true } : x);
+        const justClosed = devs.filter((x, i) => x.closed && !s.deviations[i].closed).length;
+        if (justClosed) {
+          addLog(`[P4 recovery complete] ${justClosed} deviation(s) closed: we're moving forward again.`);
+        }
+        setDeviations(devs);
+
+        /* --- Reached a checkpoint / the goal → hand the call to the P3 external gate --- */
+        const dToTarget = dist(next, target);
+        const atGate = dToTarget <= c.tolerance;
+
+        if (!atGate) {
+          if (s.phase !== 'P2') setPhase('P2');
+          setStableFrames(0);
+          setGate(null);
+          rafRef.current = requestAnimationFrame(step);
+          return;
+        }
+
+        /* --- P3 verifiable closure --- */
+        setPhase('P3');
+
+        // Stability only counts when it's consecutive — one bad frame and the counter drops to zero
+        const sf = (dToTarget <= c.tolerance && dev <= c.psiThreshold) ? s.stableFrames + 1 : 0;
+        setStableFrames(sf);
+
+        // Build the projection for the external gate — no history in it, and no self-flattery either
+        const projection = {
+          position:          { ...next },
+          distToTarget:      dToTarget,
+          psiActive:         dev > c.psiThreshold,
+          pendingDeviations: devs.filter(x => !x.closed).length,
+          stableFrames:      sf,
+        };
+
+        const verdict = externalGateVerify(projection, c);
+        setGate(verdict);
+        // Self-assessment and external verdict sit side by side — the gap between them is green ≠ proven
+        setSelfOk(internalSelfAssessment(projection, c));
+
+        if (verdict.pass) {
+          if (target.id === 'GOAL') {
+            setPhase('DONE');
+            setIsRunning(false);
+            addLog('[P3 external pass] All four checks cleared. The task closes out legitimately.');
+            return;
+          }
+          /* --- P1 stable holding: the accepted segment gets sealed and never changes again --- */
+          const sealedNow = [...s.sealed, ...newActive];
+          setSealed(sealedNow);
+          setActive([next]);
+          setSnapshots([...s.snapshots, next]);
+          // This segment passed external acceptance: archive any lingering deviations
+          // (normally P4 already closed them off through steady progress)
+          setDeviations(devs.map(x => ({ ...x, closed: true })));
+          setStableFrames(0);
+          setGate(null);
+          setCpIndex(s.cpIndex + 1);
+          setPhase('P1');
+          addLog(`[P1 seal] The ${target.id} segment passed external acceptance — ${newActive.length} points sealed (checksum ${sealChecksum(sealedNow)}). Back to steady-state holding.`);
+        } else if (sf === 0 && verdict.failing.length) {
+          addLog(`[P3 rejects] External gate says no: ${verdict.failing.map(k => verdict.reasons[k]).join('; ')}`);
+        }
+
+        rafRef.current = requestAnimationFrame(step);
+      };
+
+      useEffect(() => {
+        if (isRunning) rafRef.current = requestAnimationFrame(step);
+        return () => cancelAnimationFrame(rafRef.current);
+      }, [isRunning]);
+
+      /* ---------- P5 resumable restart ---------- */
+      const triggerCrash = () => {
+        setIsRunning(false);
+        setPhase('P5');
+        addLog('[Fatal error] Process interrupted; state space collapsed. The sealed segments live on in the persistence layer.');
+        setPos({ x: 0, y: 0 });
+        setTimeout(() => {
+          const s = simRef.current;
+          const back = s.snapshots[s.snapshots.length - 1];
+          setPos(back);
+          setActive([back]);
+          setStableFrames(0);
+          setGate(null);
+          setPhase('P2');
+          addLog(`[P5 resume] Restored to (${back.x.toFixed(0)}, ${back.y.toFixed(0)}) from the persisted snapshot. The trunk picks up where it left off — no external side effect gets replayed.`);
+          setIsRunning(true);
+        }, 1600);
+      };
+
+      /* ---------- P1 test: inject an external shock ---------- */
+      const injectShock = () => {
+        const s = simRef.current;
+        const shock = { x: s.pos.x + (Math.random() - 0.5) * 90, y: s.pos.y + (Math.random() - 0.5) * 90 };
+        setPos(shock);
+        setActive([...s.active, shock]);
+        setStableFrames(0);
+        addLog(`[External shock] The active segment got shoved; the live point moved ${dist(s.pos, shock).toFixed(1)}px. The ${s.sealed.length} sealed points moved 0px — P1 holding the line.`);
+      };
+
+      /* ---------- P3 test: try to lower the acceptance bar ---------- */
+      const tryLowerBar = () => {
+        const s = simRef.current;
+        if (s.sealed.length === 0 && s.cpIndex === 0) {
+          addLog("[P3 rejects] The acceptance bar can't be lowered: the verifier doesn't own the authority to weaken the criteria it enforces.");
+          return;
+        }
+        addLog("[P3 rejects] The acceptance bar can't be lowered: the external gate reads machine-recomputable facts only. Negotiation isn't one of them.");
+      };
+
+      const resetSim = () => {
+        setIsRunning(false);
+        setPhase('P1');
+        setPos(START);
+        setSealed([]);
+        setActive([START]);
+        setSnapshots([START]);
+        setDeviations([]);
+        setStableFrames(0);
+        setGate(null);
+        setSelfOk(false);
+        setCpIndex(0);
+        tickN.current = 0;
+        tripRef.current = 0;
+        setLogs(['[P1 steady state] Holding an established state, waiting to advance']);
+      };
+
+      /* ---------- render data ---------- */
+      const pending      = deviations.filter(x => !x.closed).length;
+      const sealedCount  = sealed.length;
+      const liveSealSum  = useMemo(() => sealChecksum(sealed), [sealed]);
+
+      const phaseColor = {
+        P1: 'text-sky-400',      P2: 'text-cyan-400',
+        P3: 'text-amber-400',    P4: 'text-red-400',
+        P5: 'text-purple-400',   DONE: 'text-emerald-400',
+      }[phase] || 'text-slate-400';
+
+      const phaseText = {
+        P1: 'P1 Stable Holding', P2: 'P2 Continuous Advance', P3: 'P3 Verifiable Closure',
+        P4: 'P4 Recoverable Failure', P5: 'P5 Resumable Restart', DONE: 'Converged',
+      }[phase] || phase;
+
+      return (
+        <div className="w-full bg-slate-900 text-cyan-50 rounded-xl font-mono shadow-2xl border border-slate-700 p-6">
+
+          {/* header */}
+          <div className="flex justify-between items-end mb-4 border-b border-slate-700 pb-4">
+            <div>
+              <h2 className="text-2xl font-bold text-cyan-400">Apex Theory — P1–P5 Convergence Simulator</h2>
+              <p className="text-slate-400 text-sm mt-1">
+                One continuous process · five necessary properties take hold in turn
+              </p>
+            </div>
+            <div className="flex gap-5">
+              <div className="flex flex-col">
+                <label className="text-xs text-slate-400 mb-1">Noise W</label>
+                <input type="range" min="0" max="30" value={noiseLevel}
+                  onChange={(e) => setNoiseLevel(Number(e.target.value))} className="w-24" />
+              </div>
+              <div className="flex flex-col">
+                <label className="text-xs text-slate-400 mb-1">Ψ Gate Threshold</label>
+                <input type="range" min="10" max="100" value={psiThreshold}
+                  onChange={(e) => setPsiThreshold(Number(e.target.value))} className="w-24" />
+              </div>
+            </div>
+          </div>
+
+          {/* canvas */}
+          <div className="relative w-full h-[500px] bg-slate-950 rounded-lg overflow-hidden border border-slate-800 mb-4 shadow-inner"
+               style={{ backgroundSize: '50px 50px',
+                        backgroundImage: 'linear-gradient(to right, #1e293b 1px, transparent 1px), linear-gradient(to bottom, #1e293b 1px, transparent 1px)' }}>
+            <svg className="absolute inset-0 w-full h-full pointer-events-none">
+              {/* the ideal path */}
+              <line x1={START.x} y1={START.y} x2={GOAL.x} y2={GOAL.y}
+                    stroke="#334155" strokeWidth="2" strokeDasharray="5,5" />
+
+              {/* P1 sealed segments: bold solid line, frozen the moment they pass */}
+              {sealed.length > 1 && (
+                <polyline points={sealed.map(p => `${p.x},${p.y}`).join(' ')}
+                          fill="none" stroke="#0ea5e9" strokeWidth="4" opacity="0.95" />
+              )}
+
+              {/* the active segment: thin dashed line, fair game for a rollback */}
+              {active.length > 1 && (
+                <polyline points={active.map(p => `${p.x},${p.y}`).join(' ')}
+                          fill="none" stroke="#22d3ee" strokeWidth="2"
+                          strokeDasharray="4,3" opacity="0.75" />
+              )}
+            </svg>
+
+            {/* checkpoints */}
+            {CHECKPOINTS.map((cp, i) => {
+              const done = i < cpIndex;
+              const cur  = i === cpIndex;
+              return (
+                <div key={cp.id}
+                     className={`absolute rounded-sm border flex items-center justify-center text-[9px] font-bold
+                       ${done ? 'border-sky-400 bg-sky-500/25 text-sky-200'
+                        : cur ? 'border-amber-400 bg-amber-500/20 text-amber-200 animate-pulse'
+                              : 'border-slate-600 bg-slate-800/60 text-slate-500'}`}
+                     style={{ left: cp.x - 13, top: cp.y - 13, width: 26, height: 26 }}>
+                  {done ? '✓' : cp.id}
+                </div>
+              );
+            })}
+
+            {/* the goal */}
+            <div className="absolute w-8 h-8 rounded-full border-2 border-emerald-500 bg-emerald-500/20 flex items-center justify-center"
+                 style={{ left: GOAL.x - 16, top: GOAL.y - 16 }}>
+              <div className="w-2 h-2 bg-emerald-400 rounded-full animate-ping" />
+            </div>
+
+            {/* P5 snapshots */}
+            {snapshots.map((s, i) => (
+              <div key={i} className="absolute w-3 h-3 bg-purple-500 rounded-sm"
+                   style={{ left: s.x - 6, top: s.y - 6, opacity: 0.55 }} />
+            ))}
+
+            {/* the live point */}
+            {pos.x !== 0 && (
+              <div className={`absolute w-4 h-4 rounded-full transition-transform duration-100
+                  ${phase === 'P4' ? 'bg-red-500 scale-150'
+                  : phase === 'P5' ? 'bg-purple-400'
+                  : phase === 'P3' ? 'bg-amber-400' : 'bg-cyan-400'}`}
+                   style={{ left: pos.x - 8, top: pos.y - 8, boxShadow: '0 0 10px currentColor' }} />
+            )}
+          </div>
+
+          {/* panels */}
+          <div className="grid grid-cols-3 gap-4">
+
+            {/* left: active mechanism + P1 evidence */}
+            <div className="bg-slate-800 p-4 rounded-lg border border-slate-700">
+              <h3 className="text-xs text-slate-400 uppercase tracking-wider mb-2">Active mechanism</h3>
+              <div className={`text-xl font-bold ${phaseColor}`}>[{phaseText}]</div>
+
+              <div className="mt-3 space-y-1 text-xs">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Distance to target</span>
+                  <span className="text-slate-300">{dist(pos, CHECKPOINTS[Math.min(cpIndex, 3)]).toFixed(0)} px</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Snapshots (P5 backbone)</span>
+                  <span className="text-purple-300">{snapshots.length}</span>
+                </div>
+              </div>
+
+              <div className="mt-3 pt-3 border-t border-slate-700">
+                <div className="text-xs text-sky-400 font-bold mb-1">P1 Stable Holding · Evidence</div>
+                <div className="space-y-1 text-[11px]">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Sealed points</span>
+                    <span className="text-sky-300">{sealedCount}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Drift since sealing</span>
+                    <span className="text-emerald-400">0 px</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Seal checksum</span>
+                    <span className="text-sky-300">{liveSealSum}</span>
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">
+                  Sealed segments never join a rollback and never budge under noise. New abstractions
+                  and new patches must not contaminate states that have already been established upstream.
+                </p>
+              </div>
+            </div>
+
+            {/* middle: the P3 external acceptance gate */}
+            <div className="bg-slate-950 p-4 rounded-lg border border-slate-800">
+              <h3 className="text-xs text-slate-400 uppercase tracking-wider mb-1">P3 External Acceptance Gate</h3>
+              <p className="text-[10px] text-slate-600 mb-2 leading-tight">
+                Reads the state projection only · No trajectory history · No self-reports
+              </p>
+
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-500">Internal self-check</span>
+                <span className={`text-[11px] font-bold ${selfOk ? 'text-emerald-400' : 'text-slate-500'}`}>
+                  {selfOk ? "GREEN · I think I've arrived" : '—'}
+                </span>
+              </div>
+
+              {gate ? (
+                <div className="space-y-1">
+                  {Object.entries(gate.checks).map(([k, v]) => (
+                    <div key={k} className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-400">
+                        {k === 'position' ? '① Within positional tolerance'
+                        : k === 'psi' ? '② No active Ψ violation'
+                        : k === 'noPending' ? '③ No open deviations'
+                        : '④ Consecutive stable frames'}
+                      </span>
+                      <span className={v ? 'text-emerald-400' : 'text-red-400'}>{v ? '✓' : '✗'}</span>
+                    </div>
+                  ))}
+                  <div className={`mt-2 pt-2 border-t border-slate-800 text-xs font-bold
+                      ${gate.pass ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {gate.pass ? 'External verdict: pass' : `External verdict: reject — ${gate.failing.map(k => gate.reasons[k]).join('; ')}`}
+                  </div>
+                </div>
+              ) : (
+                <div className="text-[11px] text-slate-600 py-4">
+                  No verdict yet. Acceptance begins when a segment reaches a checkpoint — and only the external gate decides.
+                </div>
+              )}
+
+              <div className="mt-2 pt-2 border-t border-slate-800 flex items-center justify-between text-[11px]">
+                <span className="text-slate-500">Open deviation ledger</span>
+                <span className={pending ? 'text-red-400' : 'text-emerald-400'}>{pending}</span>
+              </div>
+            </div>
+
+            {/* right: controls + trace log */}
+            <div className="flex flex-col gap-2">
+              <button onClick={() => setIsRunning(!isRunning)}
+                      disabled={phase === 'DONE' || phase === 'P5'}
+                      className="w-full py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded font-bold transition-colors disabled:opacity-50">
+                {isRunning ? 'Pause' : 'Advance (P2)'}
+              </button>
+              <button onClick={injectShock} disabled={!isRunning}
+                      className="w-full py-1.5 bg-sky-900 hover:bg-sky-800 text-sky-200 border border-sky-700 rounded text-xs transition-colors disabled:opacity-50">
+                Inject external shock (test P1)
+              </button>
+              <button onClick={triggerCrash} disabled={!isRunning}
+                      className="w-full py-1.5 bg-red-900 hover:bg-red-800 text-red-200 border border-red-700 rounded text-xs transition-colors disabled:opacity-50">
+                Simulate a crash (test P5)
+              </button>
+              <button onClick={tryLowerBar}
+                      className="w-full py-1.5 bg-amber-900 hover:bg-amber-800 text-amber-200 border border-amber-700 rounded text-xs transition-colors">
+                Try to lower the bar (test P3)
+              </button>
+              <button onClick={resetSim}
+                      className="w-full py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded text-xs transition-colors">
+                Reset
+              </button>
+
+              <div className="mt-1 bg-slate-950 rounded border border-slate-800 p-2 flex-1 overflow-hidden">
+                <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Trace</div>
+                <div className="space-y-0.5">
+                  {logs.map((log, i) => (
+                    <div key={i} className={`text-[10px] leading-tight ${i === 0 ? 'text-cyan-300' : 'text-slate-600'}`}>
+                      {log}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* legend */}
+          <div className="mt-4 pt-3 border-t border-slate-800 flex flex-wrap gap-x-5 gap-y-1 text-[10px] text-slate-500">
+            <span><span className="inline-block w-4 h-1 bg-sky-500 align-middle mr-1" />Sealed segment (P1, immutable)</span>
+            <span><span className="inline-block w-4 h-1 bg-cyan-400 align-middle mr-1 opacity-70" />Active segment (rollback-able)</span>
+            <span><span className="inline-block w-2.5 h-2.5 bg-purple-500 align-middle mr-1" />Persisted snapshot (P5)</span>
+            <span><span className="inline-block w-2.5 h-2.5 bg-amber-400 align-middle mr-1" />Checkpoint awaiting acceptance (P3)</span>
+          </div>
+
+          <p className="mt-3 text-[10px] text-slate-600 leading-relaxed">
+            What to watch for: crank the noise up and sprint for the finish line. The internal self-check
+            will stay GREEN the whole way, while the external gate keeps refusing to let the run close —
+            the "consecutive stable frames" counter keeps getting wiped to zero. That's{' '}
+            <span className="text-slate-400">green ≠ proven</span>, live. Closure authority never belonged
+            to the executor.
+          </p>
+        </div>
+      );
+    };
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<ConvergenceSimulator />);
+  </script>
+</body>
+</html>
