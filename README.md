@@ -1,4 +1,21 @@
-# Welcome to your organization's demo respository
-This code repository (or "repo") is designed to demonstrate the best GitHub has to offer with the least amount of noise.
+北极星的公开门面。
 
-The repo includes an `index.html` file (so it can render a web page), two GitHub Actions workflows, and a CSS stylesheet dependency.
+北极星是一个 Go 任务治理平台。它从 2026 年 8 月 23 日起，以零人工技术干预的方式建造自己。
+
+每一步都留证据：时间戳、逐字推理链、门输出、决策时刻的代码、commit hash。
+
+证据在 `nextAgentPolars/polars-log`，不在叙事里。
+
+证据是重的。这里放轻的：把机制做成可以亲手运行的东西。
+
+`simulator/polaris-apex-theory-simulator.html` 是一个单文件仿真器，浏览器打开即可，无需构建。
+
+它演示五条性质如何在一次收敛过程中依次成立。
+
+把噪声调大，内部自评一直 GREEN，外部闸门一直拒绝放行。
+
+green ≠ proven，收口权不在执行者手里。
+
+机制的最小可运行版本在 `HOSRookie/receipt-demo`：收据、摘要链、失效翻转，60 秒跑通。
+
+这里的东西会慢慢变多。放上来之前，先证明它值得放。
